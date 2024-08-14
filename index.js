@@ -31,9 +31,9 @@ function inject(bot) {
     let stopPathing = false
     let running = false
     const physics = new Physics(bot)
-    //const lockPlaceBlock = new Lock()
-    //const lockEquipItem = new Lock()
-    //const lockUseBlock = new Lock()
+    const lockPlaceBlock = new Lock()
+    const lockEquipItem = new Lock()
+    const lockUseBlock = new Lock()
 
     bot.pathfinder = {}
 
@@ -125,6 +125,7 @@ function inject(bot) {
         if (!stopPathing && path.length > 0) bot.emit('path_reset', reason)
         path = []
         if (digging) {
+            digging = false
             bot.on('diggingAborted', detectDiggingStopped)
             bot.on('diggingCompleted', detectDiggingStopped)
             bot.stopDigging()
@@ -132,6 +133,9 @@ function inject(bot) {
         placing = false
         pathUpdated = false
         astarContext = null
+        //lockEquipItem.release()
+        //lockPlaceBlock.release()
+        //lockUseBlock.release()
         stateMovements.clearCollisionIndex()
         if (clearStates) bot.clearControlStates()
         if (stopPathing) return stop()
@@ -169,23 +173,240 @@ function inject(bot) {
         running = false
     })
 
+    async function monitorMovement() {
+        // Test freemotion
+
+        if (stateMovements && stateMovements.allowFreeMotion && stateGoal && stateGoal.entity) {
+            const target = stateGoal.entity
+            if (physics.canStraightLine([target.position])) {
+                await bot.lookAt(target.position.offset(0, 1.6, 0))
+
+                if (target.position.distanceSquared(bot.entity.position) > stateGoal.rangeSq) {
+                    bot.setControlState('forward', true)
+                } else {
+                    bot.clearControlStates()
+                }
+                return
+            }
+        }
+        if (stateGoal) {
+            if (!stateGoal.isValid()) {
+                stop()
+            } else if (stateGoal.hasChanged()) {
+                resetPath('goal_moved', false)
+            }
+        }
+
+        if (astarContext && astartTimedout) {
+            const results = astarContext.compute()
+            results.path = postProcessPath(results.path)
+            pathFromPlayer(results.path)
+            bot.emit('path_update', results)
+            path = results.path
+            astartTimedout = results.status === 'partial'
+        }
+
+        if (bot.pathfinder.LOSWhenPlacingBlocks && returningPos) {
+            if (!moveToBlock(returningPos)) return
+            returningPos = null
+        }
+
+        if (path.length === 0) {
+            lastNodeTime = performance.now()
+            if (stateGoal && stateMovements) {
+                if (stateGoal.isEnd(bot.entity.position.floored())) {
+                    if (!dynamicGoal) {
+                        bot.emit('goal_reached', stateGoal)
+                        stateGoal = null
+                        fullStop()
+                    }
+                } else if (!pathUpdated) {
+                    const results = bot.pathfinder.getPathTo(stateMovements, stateGoal)
+                    bot.emit('path_update', results)
+                    path = results.path
+                    astartTimedout = results.status === 'partial'
+                    pathUpdated = true
+                }
+            }
+        }
+
+        if (path.length === 0) {
+            return
+        }
+
+        let nextPoint = path[0]
+        const p = bot.entity.position
+
+        // Handle digging
+        if (digging || nextPoint.toBreak.length > 0) {
+            if (!digging && bot.entity.onGround) {
+
+                digging = true
+                const b = nextPoint.toBreak.shift()
+                const block = bot.blockAt(new Vec3(b.x, b.y, b.z), false)
+                const tool = bot.pathfinder.bestHarvestTool(block)
+                fullStop()
+                try {
+                    if (!tool) {
+                        await bot.dig(block, true)
+                    } else {
+                        await bot.equip(tool, 'hand')
+                        await bot.dig(block, true)
+                    }
+                } catch (error) {
+                    resetPath('dig_error')
+                } finally {
+                    digging = false;
+                    lastNodeTime = performance.now()
+                }
+
+            }
+            return
+        }
+        // Handle block placement
+        // TODO: sneak when placing or make sure the block is not interactive
+        if (placing || nextPoint.toPlace.length > 0) {
+            if (!placing) {
+                placing = true
+                placingBlock = nextPoint.toPlace.shift()
+                fullStop()
+            }
+
+            // Open gates or doors
+            if (placingBlock?.useOne) {
+                await bot.activateBlock(bot.blockAt(new Vec3(placingBlock.x, placingBlock.y, placingBlock.z)))
+                lockUseBlock.release()
+                placingBlock = nextPoint.toPlace.shift()
+                return
+            }
+            const block = stateMovements.getScaffoldingItem()
+            if (!block) {
+                resetPath('no_scaffolding_blocks')
+                return
+            }
+            if (bot.pathfinder.LOSWhenPlacingBlocks && placingBlock.y === bot.entity.position.floored().y - 1 && placingBlock.dy === 0) {
+                if (!moveToEdge(new Vec3(placingBlock.x, placingBlock.y, placingBlock.z), new Vec3(placingBlock.dx, 0, placingBlock.dz))) return
+            }
+
+            try {
+                const refBlock = bot.blockAt(new Vec3(placingBlock.x, placingBlock.y, placingBlock.z), false)
+
+                await bot.equip(block, 'hand')
+                if (placingBlock.jump) {
+                    await scaffold(refBlock, placingBlock);
+                } else {
+                    if (interactableBlocks.includes(refBlock.name)) {
+                        bot.setControlState('sneak', true)
+                    }
+
+                    await bot.placeBlock(refBlock, new Vec3(placingBlock.dx, placingBlock.dy, placingBlock.dz))
+
+                    if (bot.pathfinder.LOSWhenPlacingBlocks && placingBlock.returnPos) returningPos = placingBlock.returnPos.clone()
+                    await bot.waitForTicks(4)
+                }
+
+            } catch (error) {
+                resetPath('place_error')
+            } finally {
+                bot.setControlState('sneak', false)
+                placing = false
+                lastNodeTime = performance.now()
+            }
+            return
+        }
+
+        let dx = nextPoint.x - p.x
+        const dy = nextPoint.y - p.y
+        let dz = nextPoint.z - p.z
+        if (Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && Math.abs(dy) < 1) {
+            // arrived at next point
+            lastNodeTime = performance.now()
+            if (stopPathing) {
+                stop()
+                return
+            }
+            path.shift()
+            if (path.length === 0) { // done
+                // If the block the bot is standing on is not a full block only checking for the floored position can fail as
+                // the distance to the goal can get greater then 0 when the vector is floored.
+                if (!dynamicGoal && stateGoal && (stateGoal.isEnd(p.floored()) || stateGoal.isEnd(p.floored().offset(0, 1, 0)))) {
+                    bot.emit('goal_reached', stateGoal)
+                    stateGoal = null
+                }
+                fullStop()
+                return
+            }
+            // not done yet
+            nextPoint = path[0]
+            if (nextPoint.toBreak.length > 0 || nextPoint.toPlace.length > 0) {
+                fullStop()
+                return
+            }
+            dx = nextPoint.x - p.x
+            dz = nextPoint.z - p.z
+        }
+
+
+        try {
+            bot.look(Math.atan2(-dx, -dz), false)
+            bot.setControlState('forward', true)
+            bot.setControlState('jump', false)
+            if (bot.entity.isInWater) {
+                bot.setControlState('jump', true)
+                bot.setControlState('sprint', false)
+            } else if (stateMovements.allowSprinting && physics.canStraightLine(path, true)) {
+                bot.setControlState('jump', false)
+                bot.setControlState('sprint', true)
+            } else if (stateMovements.allowSprinting && physics.canSprintJump(path)) {
+                bot.setControlState('jump', true)
+                bot.setControlState('sprint', true)
+            } else if (physics.canStraightLine(path)) {
+                bot.setControlState('jump', false)
+                bot.setControlState('sprint', false)
+            } else if (physics.canWalkJump(path)) {
+                bot.setControlState('jump', true)
+                bot.setControlState('sprint', false)
+            } else {
+                bot.setControlState('forward', false)
+                bot.setControlState('sprint', false)
+            }
+        } catch {
+            fullStop()
+        } finally {
+            // check for futility
+            if (performance.now() - lastNodeTime > 3500) {
+                // should never take this long to go to the next node
+                resetPath('stuck')
+            }
+            await bot.waitForTicks(2)
+        }
+    }
+
     async function scaffold(refBlock, placingBlock) {
         try {
             let blockPos = bot.entity.position.clone().plus(new Vec3(0, -1, 0));
-            await bot.lookAt(blockPos, true);
+            await bot.lookAt(blockPos, false);
             bot.setControlState('jump', true)
-            await bot.waitForTicks(5)
+            await bot.waitForTicks(4)
+            let botPos = bot.entity.position;
 
-            let blockToPut = blockPos.plus(new Vec3(0, 1, 0))
-            refBlock = bot.blockAt(blockToPut, true)
+            let canPlace = placingBlock.y + 1.8 < botPos.y
+            //console.log(`${canPlace} yb: ${botPos.y} y: ${placingBlock.y + 1.8}`)
+            if (canPlace) {
+                bot.placeBlock(refBlock, new Vec3(placingBlock.dx, placingBlock.dy, placingBlock.dz))
+                bot.setControlState('jump', false)
+            }
 
-            if (!refBlock) return
+            //bot.setControlState('jump', true)
+            //bot.setControlState('jump', false)
+            //await bot.waitForTicks(3)
 
-            bot.placeBlock(refBlock, new Vec3(0, 1, 0)).catch(x => x)
-            bot.setControlState('jump', false)
-            await bot.waitForTicks(3)
+            //if (!refBlock) return
+
+            //bot.placeBlock(refBlock, new Vec3(placingBlock.dx, placingBlock.dy, placingBlock.dz)).catch(x => x)
+            //await bot.waitForTicks(5)
         } catch (error) {
-            console.log(error);
+            console.log(error)
             bot.setControlState('jump', false);
             resetPath('place_error');
         }
@@ -441,217 +662,6 @@ function inject(bot) {
             }
         }
     })
-
-    async function monitorMovement() {
-        // Test freemotion
-        if (stateMovements && stateMovements.allowFreeMotion && stateGoal && stateGoal.entity) {
-            const target = stateGoal.entity
-            if (physics.canStraightLine([target.position])) {
-                await bot.lookAt(target.position.offset(0, 1.6, 0))
-
-                if (target.position.distanceSquared(bot.entity.position) > stateGoal.rangeSq) {
-                    bot.setControlState('forward', true)
-                } else {
-                    bot.clearControlStates()
-                }
-                return
-            }
-        }
-        if (stateGoal) {
-            if (!stateGoal.isValid()) {
-                stop()
-            } else if (stateGoal.hasChanged()) {
-                resetPath('goal_moved', false)
-            }
-        }
-
-        if (astarContext && astartTimedout) {
-            const results = astarContext.compute()
-            results.path = postProcessPath(results.path)
-            pathFromPlayer(results.path)
-            bot.emit('path_update', results)
-            path = results.path
-            astartTimedout = results.status === 'partial'
-        }
-
-        if (bot.pathfinder.LOSWhenPlacingBlocks && returningPos) {
-            if (!moveToBlock(returningPos)) return
-            returningPos = null
-        }
-
-        if (path.length === 0) {
-            lastNodeTime = performance.now()
-            if (stateGoal && stateMovements) {
-                if (stateGoal.isEnd(bot.entity.position.floored())) {
-                    if (!dynamicGoal) {
-                        bot.emit('goal_reached', stateGoal)
-                        stateGoal = null
-                        fullStop()
-                    }
-                } else if (!pathUpdated) {
-                    const results = bot.pathfinder.getPathTo(stateMovements, stateGoal)
-                    bot.emit('path_update', results)
-                    path = results.path
-                    astartTimedout = results.status === 'partial'
-                    pathUpdated = true
-                }
-            }
-        }
-
-        if (path.length === 0) {
-            return
-        }
-
-        let nextPoint = path[0]
-        const p = bot.entity.position
-
-        // Handle digging
-        if (digging || nextPoint.toBreak.length > 0) {
-            if (!digging && bot.entity.onGround) {
-                console.log("trying to dig")
-                digging = true
-                const b = nextPoint.toBreak.shift()
-                const block = bot.blockAt(new Vec3(b.x, b.y, b.z), false)
-                const tool = bot.pathfinder.bestHarvestTool(block)
-                fullStop()
-                try {
-                    if (!tool) {
-                        await bot.dig(block, true)
-                    } else {
-                        await bot.equip(tool, 'hand')
-                        await bot.dig(block, true)
-                    }
-                } catch (error) {
-                    resetPath('dig_error')
-                    console.log(error)
-                } finally {
-                    digging = false;
-                    lastNodeTime = performance.now()
-                }
-
-            }
-            return
-        }
-        // Handle block placement
-        // TODO: sneak when placing or make sure the block is not interactive
-        if (placing || nextPoint.toPlace.length > 0) {
-
-            if (!placing) {
-                placing = true
-                placingBlock = nextPoint.toPlace.shift()
-                fullStop()
-            }
-
-            // Open gates or doors
-            if (placingBlock?.useOne) {
-                await bot.activateBlock(bot.blockAt(new Vec3(placingBlock.x, placingBlock.y, placingBlock.z)))
-                placingBlock = nextPoint.toPlace.shift()
-                return
-            }
-            const block = stateMovements.getScaffoldingItem()
-            if (!block) {
-                resetPath('no_scaffolding_blocks')
-                return
-            }
-            if (bot.pathfinder.LOSWhenPlacingBlocks && placingBlock.y === bot.entity.position.floored().y - 1 && placingBlock.dy === 0) {
-                if (!moveToEdge(new Vec3(placingBlock.x, placingBlock.y, placingBlock.z), new Vec3(placingBlock.dx, 0, placingBlock.dz))) return
-            }
-
-            try {
-
-                const refBlock = bot.blockAt(new Vec3(placingBlock.x, placingBlock.y, placingBlock.z), false)
-
-                await bot.equip(block, 'hand')
-                if (placingBlock.jump) {
-                    await scaffold(refBlock, placingBlock);
-                } else {
-                    if (interactableBlocks.includes(refBlock.name)) {
-                        bot.setControlState('sneak', true)
-                    }
-
-                    await bot.placeBlock(refBlock, new Vec3(placingBlock.dx, placingBlock.dy, placingBlock.dz))
-
-
-                    if (bot.pathfinder.LOSWhenPlacingBlocks && placingBlock.returnPos) returningPos = placingBlock.returnPos.clone()
-                }
-
-            } catch (error) {
-                resetPath('place_error')
-            } finally {
-                bot.setControlState('sneak', false)
-                placing = false
-                lastNodeTime = performance.now()
-            }
-            return
-        }
-
-        let dx = nextPoint.x - p.x
-        const dy = nextPoint.y - p.y
-        let dz = nextPoint.z - p.z
-        if (Math.abs(dx) <= 0.35 && Math.abs(dz) <= 0.35 && Math.abs(dy) < 1) {
-            // arrived at next point
-            lastNodeTime = performance.now()
-            if (stopPathing) {
-                stop()
-                return
-            }
-            path.shift()
-            if (path.length === 0) { // done
-                // If the block the bot is standing on is not a full block only checking for the floored position can fail as
-                // the distance to the goal can get greater then 0 when the vector is floored.
-                if (!dynamicGoal && stateGoal && (stateGoal.isEnd(p.floored()) || stateGoal.isEnd(p.floored().offset(0, 1, 0)))) {
-                    bot.emit('goal_reached', stateGoal)
-                    stateGoal = null
-                }
-                fullStop()
-                return
-            }
-            // not done yet
-            nextPoint = path[0]
-            if (nextPoint.toBreak.length > 0 || nextPoint.toPlace.length > 0) {
-                fullStop()
-                return
-            }
-            dx = nextPoint.x - p.x
-            dz = nextPoint.z - p.z
-        }
-
-
-        try {
-            if (!placingBlock?.jump) {
-                bot.look(Math.atan2(-dx, -dz), false)
-                bot.setControlState('forward', true)
-                bot.setControlState('jump', false)
-                if (bot.entity.isInWater) {
-                    bot.setControlState('jump', true)
-                    bot.setControlState('sprint', false)
-                } else if (stateMovements.allowSprinting && physics.canStraightLine(path, true)) {
-                    bot.setControlState('jump', false)
-                    bot.setControlState('sprint', true)
-                } else if (stateMovements.allowSprinting && physics.canSprintJump(path)) {
-                    bot.setControlState('jump', true)
-                    bot.setControlState('sprint', true)
-                } else if (physics.canStraightLine(path)) {
-                    bot.setControlState('jump', false)
-                    bot.setControlState('sprint', false)
-                } else if (physics.canWalkJump(path)) {
-                    bot.setControlState('jump', true)
-                    bot.setControlState('sprint', false)
-                } else {
-                    bot.setControlState('forward', false)
-                    bot.setControlState('sprint', false)
-                }
-            }
-        } catch {
-        } finally {
-            // check for futility
-            if (performance.now() - lastNodeTime > 3500) {
-                // should never take this long to go to the next node
-                resetPath('stuck')
-            }
-        }
-    }
-
 }
 
 module.exports = {
